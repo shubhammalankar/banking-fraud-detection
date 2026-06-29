@@ -1,0 +1,48 @@
+spark:
+  app_name: fraud-detection-pipeline
+  master: local[*]
+  adaptive_query_execution: true
+  shuffle_partitions: 200
+  broadcast_threshold: 10485760  # 10MB
+
+paths:
+  raw_data: data/raw/transactions
+  bronze: data/delta/bronze/transactions
+  silver: data/delta/silver/transactions
+  gold: data/delta/gold
+  checkpoints: data/checkpoints
+
+data_generation:
+  num_records: 50000
+  num_customers: 5000
+  num_accounts: 7500
+  fraud_injection_rate: 0.08
+
+fraud_rules:
+  amount_multiplier_threshold: 5.0
+  velocity_window_minutes: 2
+  velocity_transaction_count: 5
+  impossible_travel_minutes: 30
+  high_risk_categories:
+    - gambling
+    - cryptocurrency
+    - money_transfer
+    - adult_entertainment
+  declined_threshold: 3
+  night_start_hour: 0
+  night_end_hour: 5
+  large_withdrawal_threshold: 5000
+  velocity_24h_amount_threshold: 10000
+  velocity_24h_count_threshold: 20
+
+postgres:
+  host: localhost
+  port: 5432
+  database: fraud_analytics
+  user: fraud_user
+  password: fraud_pass
+  jdbc_url: jdbc:postgresql://localhost:5432/fraud_analytics
+
+logging:
+  level: INFO
+  format: json

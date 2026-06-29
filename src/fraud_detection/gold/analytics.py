@@ -14,9 +14,11 @@ from fraud_detection.config import AppConfig
 def write_gold_table(df: DataFrame, path: str, partition_col: str | None = None) -> None:
     """Write analytics DataFrame to Gold Delta table."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    writer = df.write.format("delta").mode("overwrite").option("overwriteSchema", "true")
+    writer = df.write.format("delta").mode("overwrite")
     if partition_col and partition_col in df.columns:
         writer = writer.partitionBy(partition_col)
+    else:
+        writer = writer.option("overwriteSchema", "true")
     writer.save(path)
 
 
@@ -75,7 +77,7 @@ def build_fraud_by_merchant(scored_df: DataFrame) -> DataFrame:
 
 
 def build_fraud_by_device(scored_df: DataFrame) -> DataFrame:
-    """Gold: Fraud aggregation by device using broadcast-friendly small agg."""
+    """Gold: Fraud aggregation by device."""
     return (
         scored_df.groupBy("device_id")
         .agg(
@@ -96,7 +98,7 @@ def build_fraud_by_device(scored_df: DataFrame) -> DataFrame:
 
 def build_daily_fraud_trend(scored_df: DataFrame) -> DataFrame:
     """Gold: Daily fraud trend for time-series dashboards."""
-    return (
+    daily = (
         scored_df.groupBy("transaction_date")
         .agg(
             F.count("*").alias("total_transactions"),
@@ -110,6 +112,16 @@ def build_daily_fraud_trend(scored_df: DataFrame) -> DataFrame:
         .withColumn(
             "fraud_rate_pct",
             F.round(F.col("fraud_count") / F.col("total_transactions") * 100, 4),
+        )
+    )
+
+    trend_window = Window.orderBy("transaction_date")
+    return (
+        daily.withColumn("prev_day_fraud_rate", F.lag("fraud_rate_pct").over(trend_window))
+        .withColumn("next_day_fraud_rate", F.lead("fraud_rate_pct").over(trend_window))
+        .withColumn(
+            "day_over_day_change",
+            F.col("fraud_rate_pct") - F.col("prev_day_fraud_rate"),
         )
         .orderBy("transaction_date")
     )
@@ -153,7 +165,7 @@ def build_customer_risk_ranking(scored_df: DataFrame) -> DataFrame:
 
 
 def build_top_suspicious_accounts(scored_df: DataFrame) -> DataFrame:
-    """Gold: Top suspicious accounts with lead/lag for recent activity patterns."""
+    """Gold: Top suspicious accounts ranked by fraud score."""
     account_agg = (
         scored_df.groupBy("account_id", "customer_id")
         .agg(
@@ -210,157 +222,26 @@ def run_gold_analytics(
     results: dict[str, int] = {}
 
     tables = {
-        "fraud_scores": build_fraud_scores(scored_df),
-        "fraud_rate": build_fraud_rate(scored_df),
-        "fraud_by_country": build_fraud_by_country(scored_df),
-        "fraud_by_merchant": build_fraud_by_merchant(scored_df),
-        "fraud_by_device": build_fraud_by_device(scored_df),
-        "daily_fraud_trend": build_daily_fraud_trend(scored_df),
-        "host: localhost
-port: 5432
-database: fraud_analytics
-user: fraud_user
-password: fraud_pass
-```
+        "fraud_scores": (build_fraud_scores(scored_df), "transaction_date"),
+        "fraud_rate": (build_fraud_rate(scored_df), None),
+        "fraud_by_country": (build_fraud_by_country(scored_df), None),
+        "fraud_by_merchant": (build_fraud_by_merchant(scored_df), None),
+        "fraud_by_device": (build_fraud_by_device(scored_df), None),
+        "daily_fraud_trend": (build_daily_fraud_trend(scored_df), "transaction_date"),
+        "customer_risk_ranking": (build_customer_risk_ranking(scored_df), None),
+        "top_suspicious_accounts": (build_top_suspicious_accounts(scored_df), None),
+        "rule_trigger_summary": (build_rule_trigger_summary(scored_df), None),
+    }
 
-### 3. Generate data and run pipeline
+    for name, (df, partition) in tables.items():
+        path = f"{gold_base}/{name}"
+        write_gold_table(df, path, partition)
+        count = df.count()
+        results[name] = count
+        logger.info("gold_table_written", table=name, records=count, path=path)
 
-```bash
-python -m fraud_detection.data_generation.generator
-python -m fraud_detection.etl.pipeline --full-refresh
-```
+        if name == "fraud_by_country":
+            df.explain(mode="formatted")
+            logger.info("explain_plan_logged", table=name)
 
-### 4. Run tests
-
-```bash
-pytest tests/ -v
-```
-
----
-
-## Architecture
-
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Raw CSV    │───▶│   Bronze    │───▶│   Silver    │───▶│    Gold     │
-│  (Source)   │    │  (Ingest)   │    │ (Cleanse)   │    │ (Analytics) │
-└─────────────┘    └─────────────┘    └─────────────┘    └──────┬──────┘
-                                                                 │
-                                                                 ▼
-                                                          ┌─────────────┐
-                                                          │ PostgreSQL  │
-                                                          │ (Serving)   │
-                                                          └─────────────┘
-```
-
-### Medallion Layers
-
-| Layer | Purpose | Storage |
-|-------|---------|---------|
-| **Bronze** | Raw ingestion with metadata | Delta Lake (partitioned by `ingestion_date`) |
-| **Silver** | Validation, dedup, schema enforcement | Delta Lake (partitioned by `transaction_date`) |
-| **Gold** | Fraud scoring and analytics KPIs | Delta Lake + PostgreSQL |
-
----
-
-## Fraud Detection Rules
-
-| Rule | Description | Weight |
-|------|-------------|--------|
-| R1 | Amount exceeds 5× customer average | 15 |
-| R2 | >5 transactions in 2 minutes | 20 |
-| R3 | Impossible travel (NY→London in 30 min) | 25 |
-| R4 | International after domestic | 15 |
-| R5 | High-risk merchant category | 10 |
-| R6 | ≥3 declined transactions in 1 hour | 15 |
-| R7 | Night-time unusual spending (00:00–05:00) | 10 |
-| R8 | Device change within same session | 15 |
-| R9 | Large withdrawal after password reset | 20 |
-| R10 | 24h velocity fraud (amount + count) | 20 |
-
-**Fraud threshold:** Score ≥ 25 → flagged as fraudulent.
-
-See [docs/FRAUD_RULES.md](docs/FRAUD_RULES.md) for detailed rule logic.
-
----
-
-## Spark Optimizations
-
-- **Window Functions:** `lag`, `lead`, `dense_rank`, range-based windows
-- **Broadcast Join:** High-risk merchant lookup table
-- **Partitioning:** Date-based partitioning on Bronze/Silver/Gold
-- **Adaptive Query Execution (AQE):** Enabled for skew join and partition coalescing
-- **Incremental ETL:** Delta MERGE for idempotent Bronze/Silver loads
-- **Explain Plans:** Logged during Gold analytics for query review
-
----
-
-## Airflow Schedule
-
-| DAG | Schedule | Description |
-|-----|----------|-------------|
-| `fraud_detection_pipeline` | Daily 02:00 UTC | Full medallion pipeline |
-| `fraud_detection_incremental` | Every 4 hours | Incremental Bronze→Silver→Gold |
-
----
-
-## Project Structure
-
-```
-banking-fraud-detection/
-├── config/config.yaml          # Pipeline configuration
-├── dags/                       # Airflow DAG definitions
-├── docker/                     # Dockerfiles
-├── docs/                       # Enterprise documentation
-├── scripts/                    # Utility scripts
-├── src/fraud_detection/
-│   ├── bronze/                 # Raw ingestion
-│   ├── silver/                 # Data quality & cleansing
-│   ├── gold/                   # Fraud rules & analytics
-│   ├── postgres/               # PostgreSQL export
-│   ├── data_generation/        # Synthetic data generator
-│   └── etl/                    # Pipeline orchestration
-├── tests/                      # pytest unit tests
-├── docker-compose.yml
-└── requirements.txt
-```
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design and data flow |
-| [FRAUD_RULES.md](docs/FRAUD_RULES.md) | Fraud rule specifications |
-| [RUNBOOK.md](docs/RUNBOOK.md) | Operations runbook |
-| [API.md](docs/API.md) | PostgreSQL serving layer schema |
-
----
-
-## Monitoring & Logging
-
-- Structured JSON logging via `structlog`
-- Pipeline events tagged with `layer`, `records`, `duration_seconds`
-- Airflow task-level monitoring
-- PostgreSQL `pipeline_runs` audit table
-
----
-
-## Testing
-
-```bash
-pytest tests/ -v --tb=short
-```
-
-Test coverage:
-- Data generator output validation
-- Silver transformation (null handling, dedup, validation)
-- All 10 fraud rules with synthetic edge cases
-- Fraud score computation
-
----
-
-## License
-
-Internal use — Global Investment Bank Fraud Analytics Platform.
+    return results

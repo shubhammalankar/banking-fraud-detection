@@ -214,5 +214,19 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Streamlit
-.streamlit/secrets.toml
+# Project data artifacts
+data/
+*.csv
+
+# Spark
+metastore_db/
+spark-warehouse/
+derby.log
+
+# Airflow
+airflow/logs/
+airflow/airflow.db
+
+# Environment
+.env
+

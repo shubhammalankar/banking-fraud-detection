@@ -1,0 +1,830 @@
+================================================================================
+BANKING FRAUD DETECTION PIPELINE — INTERVIEW / TECHNICAL PREP
+================================================================================
+Project: banking-fraud-detection
+Role context: Principal Data Engineer, global investment bank
+Stack: PySpark 3.5.1, Delta Lake 3.1.0, PostgreSQL 15, Airflow 2.8.4, Docker, pytest
+
+This document explains every major design choice and how each component is
+implemented. Use it to walk through the system in interviews, design reviews,
+or onboarding sessions.
+
+================================================================================
+1. PROBLEM STATEMENT & GOALS
+================================================================================
+
+WHAT WE BUILT
+-------------
+A production-grade batch fraud detection platform that:
+  1. Ingests banking transaction events
+  2. Cleanses and validates them through a medallion architecture
+  3. Applies 10 rules-based fraud detectors using Spark window functions
+  4. Produces Gold analytics (KPIs, rankings, trends)
+  5. Exports results to PostgreSQL for downstream dashboards
+  6. Runs on a schedule via Airflow, containerized with Docker
+
+WHY BATCH (NOT STREAMING)?
+--------------------------
+  - Requirement explicitly asked for Spark batch processing
+  - Rules like 24-hour velocity fraud and customer averages need historical
+    context within a batch window
+  - Investment banks often run T+1 fraud analytics alongside real-time
+    authorization systems; this simulates the analytics/reporting layer
+  - Delta Lake MERGE gives near-batch incremental semantics without Kafka complexity
+
+WHY RULES-BASED (NOT ML)?
+--------------------------
+  - Requirement specified 10 explicit fraud rules
+  - Rules are auditable and explainable — critical in regulated banking (SAR filings,
+    model governance, OCC/FCA scrutiny)
+  - Each rule maps to a boolean column + weighted score → full traceability
+  - ML can be added later on Gold features; rules provide a baseline and labels
+
+================================================================================
+2. HIGH-LEVEL ARCHITECTURE
+================================================================================
+
+DATA FLOW
+---------
+  CSV (raw) → Bronze (Delta) → Silver (Delta) → Gold (Delta) → PostgreSQL
+
+ORCHESTRATION
+-------------
+  Airflow DAG triggers:
+    generate_data → run_pipeline → validate_fraud_rate
+
+RUNTIME
+-------
+  Local/dev: python -m fraud_detection.etl.pipeline
+  Docker:    docker-compose up (postgres + spark + airflow)
+  Prod-like: Airflow scheduler at 02:00 UTC daily
+
+DESIGN PATTERN: MEDALLION (BRONZE / SILVER / GOLD)
+--------------------------------------------------
+  Bronze  = raw, immutable-ish landing zone (+ ingestion metadata)
+  Silver  = cleansed, typed, deduplicated, business-ready
+  Gold    = fraud-scored facts + aggregated analytics
+
+WHY MEDALLION?
+  - Industry standard at Databricks/large banks (JPM, Goldman data platforms)
+  - Separates concerns: ingest vs quality vs analytics
+  - Each layer can be replayed independently (audit, backfill, debugging)
+  - Delta Lake ACID + time travel works naturally per layer
+
+================================================================================
+3. PROJECT STRUCTURE — WHY FILES LIVE WHERE THEY DO
+================================================================================
+
+banking-fraud-detection/
+├── config/config.yaml          Central config (YAML) — ops-friendly, no code deploy for tuning
+├── src/fraud_detection/        Python package (src layout — PEP 517 best practice)
+│   ├── config.py               Config loader with env var overrides
+│   ├── schemas.py              Explicit StructType contracts per layer
+│   ├── spark_session.py        Single SparkSession factory (DRY, consistent tuning)
+│   ├── logging_config.py       structlog JSON logging
+│   ├── data_generation/        Synthetic data (pandas + Faker) — separate from Spark ETL
+│   ├── bronze/                 Raw ingest only
+│   ├── silver/                 Validation + cleansing only
+│   ├── gold/                   fraud_rules.py + analytics.py (scoring vs aggregations split)
+│   ├── postgres/               JDBC export (serving layer decoupled from Spark)
+│   └── etl/pipeline.py         Orchestrator — thin, calls each layer in order
+├── dags/                       Airflow DAGs (mounted into Airflow container)
+├── docker/                     Dockerfiles + init-db.sql
+├── tests/                      pytest with Spark session fixture
+├── docs/                       Enterprise docs (ARCHITECTURE, RUNBOOK, FRAUD_RULES, API)
+├── scripts/                    run_pipeline.sh / .bat for local execution
+├── requirements.txt            Pinned deps for reproducibility
+├── pyproject.toml              Package metadata + pytest config
+└── docker-compose.yml          Full stack definition
+
+WHY src/ LAYOUT?
+  - Prevents accidental imports from repo root
+  - Standard for installable Python packages (pip install -e .)
+
+WHY SPLIT fraud_rules.py AND analytics.py?
+  - Single Responsibility: scoring logic vs KPI aggregation
+  - Rules can be unit-tested independently of Gold table writes
+  - Analytics can evolve (new dashboards) without touching rule engine
+
+================================================================================
+4. CONFIGURATION DESIGN
+================================================================================
+
+FILE: config/config.yaml + src/fraud_detection/config.py
+
+APPROACH
+--------
+  - YAML for human-readable defaults
+  - Environment variables override YAML (12-factor app pattern)
+  - Dataclasses (SparkConfig, PathsConfig, FraudRulesConfig, PostgresConfig, AppConfig)
+    for type safety in code
+
+KEY ENV VARS
+------------
+  SPARK_MASTER, DELTA_*_PATH, POSTGRES_*, LOG_LEVEL, ENVIRONMENT
+
+WHY DATACLASSES INSTEAD OF DICT?
+  - IDE autocomplete, type checking, explicit fields
+  - Fraud rule thresholds are grouped — easy to pass config.fraud_rules to rule functions
+
+WHY PATH RESOLUTION IN config.py?
+  - _resolve_path() converts relative paths to absolute from PROJECT_ROOT
+  - Same code works locally, in Docker (/app), and in Airflow container
+
+TUNABLE FRAUD PARAMETERS (without code change)
+  - amount_multiplier_threshold: 5.0
+  - velocity_window_minutes: 2, velocity_transaction_count: 5
+  - impossible_travel_minutes: 30
+  - high_risk_categories: list in YAML
+  - declined_threshold: 3
+  - night hours: 0–5
+  - large_withdrawal_threshold: 5000
+  - velocity_24h: amount >= 10000 AND count >= 20
+
+================================================================================
+5. SPARK SESSION DESIGN
+================================================================================
+
+FILE: src/fraud_detection/spark_session.py
+
+KEY DECISIONS
+-------------
+
+1. DELTA LAKE INTEGRATION
+   - spark.sql.extensions = DeltaSparkSessionExtension
+   - spark.sql.catalog.spark_catalog = DeltaCatalog
+   - configure_spark_with_delta_pip() pulls delta-spark JAR via Ivy
+   WHY: Enables MERGE, ACID writes, schema evolution
+
+2. STOP EXISTING SESSION BEFORE CREATE
+   - SparkSession.getActiveSession() → stop if exists
+   WHY: Prevents reusing a session without Delta configs (common in notebooks/tests)
+
+3. ADAPTIVE QUERY EXECUTION (AQE)
+   - spark.sql.adaptive.enabled = true
+   - coalescePartitions + skewJoin enabled
+   WHY: Auto-optimizes shuffle partitions and skewed joins at runtime (Spark 3.x)
+
+4. SHUFFLE PARTITIONS = 200
+   WHY: Default for ~50K–few-million rows; configurable per environment
+
+5. BROADCAST THRESHOLD = 10MB
+   WHY: Small lookup tables (high-risk categories) auto-broadcast; explicit
+        broadcast() also used in Rule 5
+
+6. TIMEZONE = UTC
+   WHY: Banking systems standardize on UTC; avoids DST bugs in night-spending rule
+
+7. DYNAMIC PARTITION OVERWRITE
+   - spark.sql.sources.partitionOverwriteMode = dynamic
+   WHY: Overwriting Gold partitioned tables only touches affected partitions
+   NOTE: Cannot combine overwriteSchema with dynamic partition overwrite — Gold
+         writer uses overwriteSchema only on non-partitioned tables
+
+8. DEV MEMORY
+   - 4g driver/executor when environment=development
+   WHY: 50K records with window functions need headroom on local machine
+
+================================================================================
+6. SCHEMA DESIGN (schemas.py)
+================================================================================
+
+THREE EXPLICIT SCHEMAS — WHY DIFFERENT TYPES PER LAYER?
+
+BRONZE: All StringType (except required IDs)
+  WHY: Raw landing preserves source as-is; no data loss from cast failures
+       PERMISSIVE CSV mode + explicit schema prevents column drift
+
+SILVER: Strong types (Timestamp, Double, Boolean, Date, Integer)
+  WHY: Downstream rules assume numeric amounts, proper timestamps
+       Nullable vs non-nullable encodes business required fields
+
+GOLD: Fraud flags schema documented (reference contract)
+  WHY: Documents expected output for consumers / PostgreSQL
+
+EXTRA SILVER COLUMNS (derived, not in source CSV)
+  - transaction_date, transaction_hour → partition + night rule
+  - is_domestic (country == US) → Rule 4
+  - processed_at → lineage / audit
+  - password_reset_flag, session_id → Rules 8, 9 (from generator)
+
+================================================================================
+7. DATA GENERATION
+================================================================================
+
+FILE: src/fraud_detection/data_generation/generator.py
+
+WHY PANDAS + FAKER (NOT SPARK) FOR GENERATION?
+  - Data generation is a one-off pre-ETL step; pandas is simpler and faster for 50K rows
+  - Faker provides realistic merchants, IPs, company names
+  - Keeps Spark cluster free until actual ETL
+
+REPRODUCIBILITY
+  - Faker.seed(42), random.seed(42) → deterministic fraud injection for tests
+
+VOLUME
+  - Default 50,000 records, 5,000 customers, ~1 account per customer
+  - Output: data/raw/transactions/transactions_YYYY-MM-DD.csv
+
+FIELDS GENERATED (all required columns)
+  transaction_id, account_id, customer_id, timestamp, amount, merchant,
+  merchant_category, city, country, latitude, longitude, payment_type,
+  device_id, ip_address, account_balance, transaction_status,
+  password_reset_flag, session_id
+
+REALISM TECHNIQUES
+  - 12 global cities with fixed lat/lon (NYC, London, Tokyo, etc.)
+  - Log-normal amounts for natural spending distribution
+  - Customers have home cities (weighted 3:1 toward home)
+  - Business hours bias (6–22) for normal transactions
+
+FRAUD INJECTION STRATEGY
+  - After generating num_records legitimate transactions, _inject_fraud_patterns()
+    appends known fraud scenarios for ~330 customers across 10 rule types
+  - Then sample + head(num_records) to cap at exactly 50K
+  WHY: Guarantees each rule has positive examples for validation/demo
+       Without injection, random data rarely triggers impossible travel etc.
+
+INJECTION MAPPING (approximate counts per rule)
+  Rule 1: 50 customers — amount 6–15x average
+  Rule 2: 30 customers — 7 txns in 15-second intervals
+  Rule 3: 30 customers — NY then London in 20 min
+  Rule 4: 30 customers — US city then Tokyo in 2 min
+  Rule 5: 40 customers — gambling/crypto/money_transfer categories
+  Rule 6: 30 customers — 4 declined in 5-min intervals
+  Rule 7: 30 customers — 2:30 AM, $2K–8K
+  Rule 8: 30 customers — same session, different device_id
+  Rule 9: 30 customers — password_reset=True then $6K+ withdrawal
+  Rule 10: 30 customers — 25 txns over 12 hours
+
+DESIGN TRADE-OFF
+  - Injection + sampling means some legitimate rows are dropped when capping at 50K
+  - Alternative: generate exactly N with in-place fraud replacement (more complex)
+
+================================================================================
+8. BRONZE LAYER
+================================================================================
+
+FILE: src/fraud_detection/bronze/ingest.py
+
+RESPONSIBILITY
+  Read raw CSV → enrich with metadata → write Delta (incremental)
+
+READ STRATEGY
+  - spark.read.csv with header, PERMISSIVE mode, BRONZE_TRANSACTION_SCHEMA
+  WHY PERMISSIVE: Bad rows go to _corrupt_record instead of failing entire batch
+  WHY EXPLICIT SCHEMA: Prevents inferSchema surprises (amount read as int, etc.)
+
+ENRICHMENT COLUMNS
+  - ingestion_timestamp (ISO UTC string)
+  - source_file (input_file_name())
+  - ingestion_date (derived for partitioning)
+  WHY: Audit trail — know WHEN and WHICH FILE each row came from
+
+PARTITIONING: ingestion_date
+  WHY: Bronze batches typically arrive daily; partition pruning on backfill/replay
+
+INCREMENTAL WRITE: Delta MERGE
+  - Key: transaction_id
+  - whenNotMatchedInsertAll() only (Bronze is append-only semantics)
+  - First run: overwrite + partitionBy if table doesn't exist
+  WHY MERGE: Re-running same CSV doesn't duplicate rows (idempotent ingest)
+  WHY NOT UPDATE on Bronze: Bronze should preserve first-seen raw state; updates
+       happen in Silver
+
+REPARTITION BEFORE WRITE
+  - repartition(ingestion_date) co-locates rows for efficient partition writes
+
+================================================================================
+9. SILVER LAYER
+================================================================================
+
+FILE: src/fraud_detection/silver/transform.py
+
+RESPONSIBILITY
+  Validate → cast → null-handle → deduplicate → enrich → enforce schema → MERGE
+
+PIPELINE ORDER (matters!)
+  1. validate_and_cast
+  2. handle_nulls
+  3. remove_duplicates
+  4. enrich_silver
+  5. enforce_schema
+
+STEP 1: validate_and_cast
+  - Cast strings to Timestamp, Double, Boolean
+  - Normalize strings: lower(status), upper(country), trim
+  - password_reset_flag: accepts "true", "1", "yes" (CSV compatibility)
+  - FILTERS (hard rejects):
+      null IDs, null timestamp, amount <= 0
+      invalid transaction_status (must be approved|declined|pending|reversed)
+      invalid payment_type (5 allowed types)
+  WHY FILTER NOT QUARANTINE: Simplicity; production would route rejects to quarantine Delta table
+
+STEP 2: handle_nulls
+  - coalesce() with business defaults (UNKNOWN merchant, US country, 0.0 coords)
+  - session_id defaults to transaction_id if missing
+  WHY: Rules shouldn't NPE on nulls; defaults are conservative
+
+STEP 3: remove_duplicates
+  - Window: partitionBy(transaction_id), orderBy(ingestion_timestamp DESC)
+  - row_number() = 1 keeps latest ingestion
+  WHY: Same txn re-ingested → keep newest version for Silver
+  DROPS: ingestion metadata columns (not needed downstream)
+
+STEP 4: enrich_silver
+  - transaction_date = to_date(timestamp)
+  - transaction_hour = hour(timestamp)
+  - is_domestic = (country == "US")
+  - processed_at = utcnow()
+  WHY PRECOMPUTE: Avoids repeating expressions in 10 fraud rules
+
+STEP 5: enforce_schema
+  - select() columns matching SILVER_TRANSACTION_SCHEMA exactly
+  WHY: Schema contract enforcement for Gold consumers
+
+PARTITIONING: transaction_date
+  WHY: Business queries and fraud trends are date-centric; aligns with Gold partitions
+
+INCREMENTAL WRITE: Delta MERGE
+  - whenMatchedUpdateAll() + whenNotMatchedInsertAll()
+  WHY: Silver is the "current truth" — reprocessing updates cleansed records
+
+================================================================================
+10. GOLD LAYER — FRAUD RULES ENGINE
+================================================================================
+
+FILE: src/fraud_detection/gold/fraud_rules.py
+
+SCORING MODEL
+  - Each rule: boolean column (rule_1..rule_10)
+  - Weighted sum → fraud_score (max theoretical: 165)
+  - is_fraudulent = fraud_score >= 25
+  - triggered_rules = comma-separated rule IDs for explainability
+
+WHY WEIGHTED SCORING VS ANY-RULE-FLAGS?
+  - Multiple weak signals can combine to cross threshold
+  - Single high-confidence rule (impossible travel = 25) can flag alone
+  - Tunable sensitivity without adding/removing rules
+
+WHY THRESHOLD = 25?
+  - Lowest single high-impact rule (R3 impossible travel) flags alone
+  - R5 alone (10) doesn't flag — reduces false positives on gambling alone
+  - Combination rules (R2+R5 = 30) flag together
+
+RULE-BY-RULE IMPLEMENTATION
+---------------------------
+
+RULE 1 — Amount Anomaly (weight 15)
+  Logic: amount > AVG(amount) OVER (PARTITION BY customer_id) * 5
+  Spark: Window partitionBy(customer_id), no orderBy (whole history avg)
+  WHY AVG not MEDIAN: Spark lacks native median in window without percentile_approx
+
+RULE 2 — Velocity Burst (weight 20)
+  Logic: >5 transactions within 2 minutes
+  Spark: rangeBetween(0, 120) on timestamp cast to long (seconds)
+  WHY RANGE window: Sliding time window; rows ordered by epoch seconds
+  NOTE: rangeBetween is inclusive on both ends in Spark
+
+RULE 3 — Impossible Travel (weight 25)
+  Logic: Specific city pairs within 30 minutes (NY↔London, LA↔Tokyo, Chicago↔Dubai)
+  Spark: lag(city), lag(timestamp) OVER (customer_id ORDER BY timestamp)
+  WHY CITY PAIRS not HAVERSINE: Requirement explicitly named NY→London;
+       pair list is faster and auditable; production would use geo distance
+  WHY LAG: Compare current txn to immediately previous txn per customer
+
+RULE 4 — International After Domestic (weight 15)
+  Logic: Previous txn domestic (US), current international, within 5 minutes
+  Spark: lag(is_domestic), lag(timestamp)
+  WHY 5 MINUTES: "Immediately after" — tight window reduces false flags on
+       legitimate travel days
+
+RULE 5 — High-Risk Merchant (weight 10)
+  Logic: merchant_category in {gambling, cryptocurrency, money_transfer, adult_entertainment}
+  Spark: broadcast join to tiny lookup DataFrame
+  WHY BROADCAST: Lookup is ~4 rows; broadcast avoids shuffle join on large fact table
+  WHY JOIN vs isin(): Demonstrates broadcast join pattern explicitly (requirement)
+
+RULE 6 — Multiple Declined (weight 15)
+  Logic: >=3 declined in rolling 1-hour window
+  Spark: sum(CASE WHEN declined THEN 1) OVER rangeBetween(-3600, 0)
+  WHY SUM not COUNT: COUNT counts all rows; SUM counts only declined
+
+RULE 7 — Night Spending (weight 10)
+  Logic: Hour 0–5 AND amount > 3x customer average
+  Spark: uses precomputed transaction_hour from Silver
+  WHY 3x multiplier: Stricter than Rule 1's 5x — night activity is suspicious enough
+
+RULE 8 — Device Change (weight 15)
+  Logic: device_id != previous device_id within same session_id
+  Spark: lag(device_id) OVER (PARTITION BY customer_id, session_id ORDER BY timestamp)
+  WHY SESSION PARTITION: Device changes across sessions are normal (phone + laptop)
+
+RULE 9 — Post-Reset Withdrawal (weight 20)
+  Logic: Previous txn had password_reset_flag=True, current amount >= $5000, within 2 hours
+  Spark: lag(password_reset_flag), lag(timestamp)
+  WHY LAG ON RESET FLAG: Detects reset event on prior row, large txn on current row
+
+RULE 10 — Velocity Fraud (weight 20)
+  Logic: In 24h window: sum(amount) >= $10,000 AND count >= 20
+  Spark: rangeBetween(-86400, 0) — both conditions must be true (AND)
+  WHY DUAL CONDITION: High count alone could be micro-payments; high amount alone
+       could be one wire; together = structuring/mule pattern
+
+COMPUTE_FRAUD_SCORE
+  - Builds score_expr by iterating RULE_WEIGHTS dict
+  - triggered_rules via concat_ws of conditional rule labels
+  - scored_at timestamp for lineage
+
+SEQUENTIAL RULE APPLICATION
+  - apply_all_fraud_rules() chains 10 functions then compute_fraud_score
+  WHY SEQUENTIAL: Each adds columns; readable, testable per rule
+  TRADE-OFF: Could combine in single select for perf at scale (100M+ rows)
+
+ACTUAL RUN RESULTS (50K records)
+  - Total: 50,000 transactions
+  - Fraudulent (score >= 25): 212 (~0.42%)
+  WHY LOW RATE: Most rows are legitimate; injected fraud is ~330 customers but
+       sampling + threshold means only multi-rule or high-weight triggers count
+
+================================================================================
+11. GOLD LAYER — ANALYTICS
+================================================================================
+
+FILE: src/fraud_detection/gold/analytics.py
+
+NINE GOLD TABLES
+----------------
+
+1. fraud_scores (50,000 rows)
+   - Full scored transaction fact table
+   - Partitioned by transaction_date
+   - Primary output for investigation tools
+
+2. fraud_rate (1 row)
+   - KPI: total_transactions, fraudulent_transactions, fraud_rate_pct
+   - Used by Airflow validation task
+
+3. fraud_by_country (10 rows)
+   - Aggregates by country with fraud_count, fraud_rate_pct, fraud_amount
+   - explain() logged for query plan review (requirement: Explain Plans)
+
+4. fraud_by_merchant (top 100)
+   - merchant + category grain
+   - Ordered by fraud_count DESC
+
+5. fraud_by_device (top 100)
+   - device_id grain with unique_customers count
+   - Filters fraud_count > 0
+
+6. daily_fraud_trend (151 rows — one per transaction date in data)
+   - Time series for dashboards
+   - Uses lag() for prev_day_fraud_rate
+   - Uses lead() for next_day_fraud_rate
+   - day_over_day_change computed
+   WHY LAG + LEAD: Requirement asked for both; shows day-over-day trend analysis
+
+7. customer_risk_ranking (5,000 rows — one per customer)
+   - Aggregates: fraud_count, max/avg scores, fraud_exposure
+   - dense_rank() OVER (ORDER BY max_fraud_score DESC, fraud_count DESC)
+   WHY DENSE_RANK not ROW_NUMBER: Tied customers get same rank (fair tier assignment)
+   - risk_tier: CRITICAL (top 10), HIGH (11–50), MEDIUM (51–200), LOW (rest)
+
+8. top_suspicious_accounts (50 rows)
+   - account_id + customer_id grain
+   - collect_set(triggered_rules) for rule mix visibility
+   - suspicion_level: SEVERE/HIGH/ELEVATED/MODERATE based on max_fraud_score
+
+9. rule_trigger_summary (10 rows)
+   - Count per rule column — which rules fire most often
+   - Useful for tuning weights and false positive analysis
+
+WRITE STRATEGY
+  - mode("overwrite") for all Gold tables (full recompute each batch)
+  WHY OVERWRITE ON GOLD: Fraud scores depend on full customer history (windows);
+       incremental Gold scoring would need complex state management
+  - Partitioned tables: NO overwriteSchema (Delta conflict with dynamic overwrite)
+  - Non-partitioned: overwriteSchema=true for schema evolution
+
+================================================================================
+12. POSTGRESQL EXPORT
+================================================================================
+
+FILE: src/fraud_detection/postgres/export.py
+
+WHY POSTGRESQL?
+  - Requirement specified it
+  - BI tools (Tableau, Metabase, internal dashboards) connect easily via SQL
+  - OLTP-friendly serving layer separate from Spark compute
+
+EXPORT MECHANISM
+  - Spark JDBC write: format("jdbc"), mode overwrite per table
+  - Driver: org.postgresql.Driver
+  - batchsize=5000 for write throughput
+
+AUDIT TABLE: pipeline_runs
+  - run_id, status, layer_stats, duration_seconds
+  - Appended after each successful run
+  - init-db.sql creates table on Postgres container startup
+
+SKIP FLAG: --skip-postgres
+  - For local dev without Postgres running
+  - Incremental Airflow DAG skips Postgres (Delta is source of truth)
+
+================================================================================
+13. ETL PIPELINE ORCHESTRATOR
+================================================================================
+
+FILE: src/fraud_detection/etl/pipeline.py
+
+EXECUTION ORDER
+  1. Optional: generate_transactions_from_config()
+  2. create_spark_session()
+  3. ingest_bronze()
+  4. process_silver()
+  5. score_transactions()
+  6. run_gold_analytics()
+  7. export_gold_to_postgres() (optional)
+  8. log_pipeline_run() (optional)
+  9. spark.stop() in finally block
+
+CLI FLAGS
+  --generate-data   Run generator before ETL
+  --full-refresh    Alias: generate-data + full pipeline
+  --skip-postgres   Skip JDBC export
+
+OBSERVABILITY
+  - run_id = UUID per execution
+  - duration_seconds tracked
+  - Structured JSON logs at start, each layer, completion, failure
+  - Returns stats dict printed at end
+
+ERROR HANDLING
+  - try/except logs pipeline_failed with error + duration, then re-raises
+  - finally ensures Spark session stops (prevent orphaned JVM on Windows)
+
+ACTUAL TIMING: ~504 seconds (~8.4 min) for 50K rows on local Windows machine
+  - Window functions over 50K rows with 200 shuffle partitions is CPU-heavy
+  - Production cluster with more executors would be faster
+
+================================================================================
+14. INCREMENTAL ETL SEMANTICS
+================================================================================
+
+LAYER          | STRATEGY                    | KEY
+---------------|-----------------------------|-----------------
+Bronze         | MERGE whenNotMatchedInsert  | transaction_id
+Silver         | MERGE upsert                | transaction_id
+Gold           | Full overwrite              | N/A (batch recompute)
+PostgreSQL     | JDBC overwrite per table  | N/A
+
+WHY BRONZE IS INSERT-ONLY MERGE
+  - Preserves first-ingested raw values
+  - Re-delivered files don't create duplicates
+
+WHY SILVER IS UPSERT
+  - Corrected/reprocessed transactions update cleansed view
+
+WHY GOLD IS FULL REFRESH
+  - Window-based rules (24h velocity, customer avg) need full history each run
+  - At scale: optimize with structured streaming or incremental window state
+
+CHECKPOINT PATH
+  - config.paths.checkpoints reserved for future streaming/checkpoint use
+
+================================================================================
+15. LOGGING & MONITORING
+================================================================================
+
+FILE: src/fraud_detection/logging_config.py
+
+LIBRARY: structlog with JSONRenderer
+
+WHY STRUCTLOG?
+  - Machine-parseable logs → ELK, Datadog, Splunk without regex
+  - Context vars (pipeline, layer, run_id) on every event
+
+KEY EVENTS
+  pipeline_started, bronze_ingest_complete, silver_process_complete,
+  fraud_scoring_complete, gold_table_written, pipeline_completed, pipeline_failed
+
+AIRFLOW MONITORING
+  - validate_fraud_rate task reads gold/fraud_rate Delta table
+  - Raises if fraud_rate_pct > 50% (data quality guardrail)
+  - Pushes fraud_rate_pct to XCom for downstream alerting
+
+WHAT'S NOT INCLUDED (production would add)
+  - Prometheus metrics, OpenTelemetry traces, PagerDuty integration
+  - Delta table row-count checksums between layers
+
+================================================================================
+16. AIRFLOW DESIGN
+================================================================================
+
+FILE: dags/fraud_detection_dag.py
+
+TWO DAGS
+--------
+
+1. fraud_detection_pipeline (daily 02:00 UTC)
+   generate_transaction_data → run_medallion_pipeline → validate_fraud_rate
+   WHY 02:00 UTC: After global market close windows; low cluster contention
+
+2. fraud_detection_incremental (every 4 hours)
+   run_incremental_pipeline (--skip-postgres)
+   WHY: Simulates intraday batch refresh for ops dashboards
+
+DEFAULT ARGS
+  - retries=2, retry_delay=5min, execution_timeout=2hr
+  - email_on_failure=True (placeholder — needs SMTP config)
+
+EXECUTOR: LocalExecutor
+  WHY: Simple Docker setup; production would use Celery/KubernetesExecutor
+
+METADATA DB: Same PostgreSQL as analytics (fraud_analytics database)
+  NOTE: Production should separate Airflow metadata DB from serving DB
+
+================================================================================
+17. DOCKER DESIGN
+================================================================================
+
+FILE: docker-compose.yml
+
+SERVICES
+  postgres       — analytics DB + Airflow metadata + init-db.sql
+  spark          — one-shot pipeline runner (generate + ETL)
+  airflow-init   — airflow db init
+  airflow-webserver — port 8080
+  airflow-scheduler
+
+WHY apache/spark:3.5.1-python3 BASE for Spark container?
+  - Matches PySpark version exactly
+  - Pre-installed Spark runtime
+
+WHY SEPARATE Dockerfile.airflow?
+  - Airflow image needs airflow user, providers, different entrypoint
+  - Adds openjdk-17 for Spark subprocess launched from Airflow tasks
+
+VOLUME MOUNTS
+  ./data → /app/data (Delta tables persist on host)
+  ./src, ./config, ./dags → live reload during dev
+
+HEALTHCHECK on Postgres
+  - spark and airflow-init wait for healthy postgres
+  WHY: Prevents JDBC connection failures on startup race
+
+ENV VAR INJECTION
+  - Docker sets POSTGRES_HOST=postgres (service name DNS)
+  - Overrides config.yaml localhost defaults
+
+================================================================================
+18. TESTING STRATEGY
+================================================================================
+
+FRAMEWORK: pytest + pytest-spark
+
+FILE: tests/conftest.py
+  - Session-scoped Spark fixture with Delta (configure_spark_with_delta_pip)
+  - test_config fixture with temp directory paths (isolated Delta tables)
+  - sample_transactions fixture with 8 hand-crafted edge cases
+
+TEST FILES
+  test_data_generator.py  — schema, count, valid statuses, positive amounts
+  test_silver_transform.py — validation filters, null handling, dedup, schema
+  test_fraud_rules.py — individual rules (R3, R5, R6, R9), scoring, full pipeline
+
+WHY SESSION-SCOPED SPARK?
+  - Spark startup is ~15–30s; amortize across all tests
+
+WHY HAND-CRAFTED FIXTURES FOR RULES?
+  - Injection-based 50K dataset doesn't guarantee edge cases in unit tests
+  - Explicit NY→London in 20 min guarantees R3 triggers
+
+COVERAGE GAPS (honest assessment)
+  - No integration test for full pipeline end-to-end in CI
+  - No Bronze MERGE idempotency test
+  - No PostgreSQL export test (would need testcontainers)
+  - No Airflow DAG parse test
+
+RUN: PYTHONPATH=src pytest tests/ -v
+RESULT: 16 passed
+
+================================================================================
+19. SPARK FEATURES CHECKLIST (REQUIREMENT MAPPING)
+================================================================================
+
+Feature              | Where Used
+---------------------|--------------------------------------------------
+Window Functions     | All 10 fraud rules, dedup, rankings
+lag()                | R3, R4, R6, R8, R9; daily_fraud_trend (prev_day)
+lead()               | daily_fraud_trend (next_day)
+dense_rank()         | customer_risk_ranking, top_suspicious_accounts
+Broadcast Join       | Rule 5 high-risk merchant lookup
+Partitioning         | Bronze: ingestion_date; Silver/Gold: transaction_date
+AQE                  | spark_session.py (adaptive.enabled, skew, coalesce)
+Explain Plans        | fraud_by_country.explain() in run_gold_analytics
+Delta MERGE          | Bronze + Silver incremental
+row_number()         | Silver deduplication
+
+================================================================================
+20. SECURITY & COMPLIANCE NOTES
+================================================================================
+
+  - Credentials in .env / environment variables, not committed (.gitignore)
+  - .env.example provides template without secrets
+  - Logs use transaction_id, not customer PII names
+  - password_reset_flag modeled for Rule 9 — sensitive event in real systems
+  - Fraud rules are explainable (triggered_rules column) for regulatory audit
+
+PRODUCTION HARDENING (not implemented — know for interviews)
+  - Secrets Manager / Vault for Postgres creds
+  - Column-level encryption for account_balance
+  - Row-level security in PostgreSQL
+  - SOC2 logging retention policies
+
+================================================================================
+21. ALTERNATIVES CONSIDERED & TRADE-OFFS
+================================================================================
+
+CHOICE                    | ALTERNATIVE              | WHY WE CHOSE THIS
+--------------------------|--------------------------|---------------------------
+Delta Lake                | Parquet + Hive           | MERGE, ACID, schema evolution
+Rules engine              | ML classifier            | Requirement + explainability
+Pandas generator          | Spark generation         | Simpler for 50K; faster dev
+YAML config               | Hardcoded constants      | Ops tuning without deploy
+Full Gold overwrite       | Incremental Gold         | Window rules need full history
+String Bronze schema      | Infer schema             | No type guessing surprises
+Weighted score            | Binary any-rule          | Nuanced risk levels
+LocalExecutor Airflow     | KubernetesExecutor       | Docker simplicity
+Single postgres DB        | Separate metadata DB     | Dev convenience; split in prod
+
+================================================================================
+22. HOW TO RUN & DEMO
+================================================================================
+
+LOCAL (Windows)
+  pip install -r requirements.txt
+  set PYTHONPATH=src
+  python -m fraud_detection.etl.pipeline --full-refresh --skip-postgres
+
+  OR: scripts\run_pipeline.bat
+
+LOCAL (Linux/Mac)
+  export PYTHONPATH=src
+  bash scripts/run_pipeline.sh
+
+DOCKER FULL STACK
+  docker-compose up -d
+  Airflow UI: http://localhost:8080
+  Postgres: localhost:5432 (fraud_user / fraud_pass / fraud_analytics)
+
+TESTS
+  PYTHONPATH=src pytest tests/ -v
+
+INSPECT OUTPUT
+  Delta tables: data/delta/bronze|silver|gold/
+  Raw CSV: data/raw/transactions/
+  Gold fraud_rate: read via Spark or Postgres after export
+
+================================================================================
+23. INTERVIEW TALKING POINTS (ELEVATOR PITCH)
+================================================================================
+
+30-SECOND VERSION
+  "We built a medallion fraud detection pipeline in PySpark. Raw transactions
+   land in Bronze Delta, get cleansed in Silver, then pass through 10 weighted
+   fraud rules using Spark window functions in Gold. Results export to
+   PostgreSQL for dashboards. Airflow schedules daily runs; everything is
+   Dockerized with structured JSON logging and pytest coverage."
+
+2-MINUTE DEEP DIVE
+  1. Start with business problem: detect fraudulent banking transactions at scale
+  2. Medallion architecture: why Bronze/Silver/Gold separation
+  3. Pick 2–3 interesting rules: impossible travel (lag), velocity (range window),
+     post-reset withdrawal (event sequence)
+  4. Scoring model: weighted sum, threshold 25, explainability via triggered_rules
+  5. Ops: Airflow schedule, fraud rate validation, incremental MERGE on Silver
+  6. Results: 50K txns, 212 flagged (0.42%), 9 Gold analytics tables
+
+LIKELY FOLLOW-UP QUESTIONS & ANSWERS
+
+Q: How would you scale to 1 billion transactions?
+A: Partition Silver by date, filter last N days for window rules; broadcast small
+   lookups; increase shuffle partitions; use Delta Z-order on customer_id;
+   consider structured streaming for velocity rules; ML on Gold features.
+
+Q: How do you handle false positives?
+A: Rule trigger summary + fraud_rate monitoring; tune weights/thresholds in YAML;
+   shadow mode before changing threshold; customer_risk_ranking tiers for review queue.
+
+Q: Why Delta MERGE instead of append + dedup?
+A: MERGE is atomic and idempotent — critical for exactly-once ingest semantics
+   when Airflow retries failed tasks.
+
+Q: How would you add real-time fraud?
+A: Keep this batch for analytics; add Kafka + Structured Streaming for sub-second
+   rules (R2 velocity burst); use Redis for session state; batch Gold for trends.
+
+================================================================================
+END OF PREP DOCUMENT
+================================================================================
