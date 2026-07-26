@@ -2,8 +2,6 @@
 
 A production-style, PySpark-based fraud detection pipeline built around the **Medallion Architecture** (Bronze → Silver → Gold). It ingests raw banking transactions, cleanses and validates them, scores them against a 10-rule fraud engine, computes analytics KPIs, and serves the results to PostgreSQL — all orchestrated with Apache Airflow and packaged for Docker.
 
-> **Note:** This README was regenerated from the project source. The previous `README.md` in this repository had been accidentally overwritten with the contents of `src/fraud_detection/gold/analytics.py` (with only the final section of the original README surviving). Nothing in the source code was changed.
-
 ---
 
 ## Overview
