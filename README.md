@@ -1,240 +1,24 @@
-"""Gold layer analytics: fraud KPIs, rankings, and trend aggregations."""
+# Banking Fraud Detection Pipeline
 
-from __future__ import annotations
+A production-style, PySpark-based fraud detection pipeline built around the **Medallion Architecture** (Bronze → Silver → Gold). It ingests raw banking transactions, cleanses and validates them, scores them against a 10-rule fraud engine, computes analytics KPIs, and serves the results to PostgreSQL — all orchestrated with Apache Airflow and packaged for Docker.
 
-from pathlib import Path
+> **Note:** This README was regenerated from the project source. The previous `README.md` in this repository had been accidentally overwritten with the contents of `src/fraud_detection/gold/analytics.py` (with only the final section of the original README surviving). Nothing in the source code was changed.
 
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+---
 
-from fraud_detection.config import AppConfig
+## Overview
 
+| | |
+|---|---|
+| **Domain** | Banking / financial transaction fraud detection |
+| **Engine** | PySpark 3.5 + Delta Lake 3.1 |
+| **Architecture** | Medallion (Bronze / Silver / Gold) |
+| **Orchestration** | Apache Airflow |
+| **Serving layer** | PostgreSQL |
+| **Packaging** | Docker / Docker Compose |
+| **Testing** | pytest |
 
-def write_gold_table(df: DataFrame, path: str, partition_col: str | None = None) -> None:
-    """Write analytics DataFrame to Gold Delta table."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    writer = df.write.format("delta").mode("overwrite").option("overwriteSchema", "true")
-    if partition_col and partition_col in df.columns:
-        writer = writer.partitionBy(partition_col)
-    writer.save(path)
-
-
-def build_fraud_scores(scored_df: DataFrame) -> DataFrame:
-    """Gold: Individual transaction fraud scores (primary fact table)."""
-    return scored_df
-
-
-def build_fraud_rate(scored_df: DataFrame) -> DataFrame:
-    """Gold: Overall fraud rate KPI."""
-    total = scored_df.count()
-    fraud = scored_df.filter(F.col("is_fraudulent")).count()
-    return scored_df.sparkSession.createDataFrame(
-        [(total, fraud, round(fraud / total * 100, 4) if total else 0.0)],
-        ["total_transactions", "fraudulent_transactions", "fraud_rate_pct"],
-    )
-
-
-def build_fraud_by_country(scored_df: DataFrame) -> DataFrame:
-    """Gold: Fraud aggregation by country."""
-    return (
-        scored_df.groupBy("country")
-        .agg(
-            F.count("*").alias("total_transactions"),
-            F.sum(F.when(F.col("is_fraudulent"), 1).otherwise(0)).alias("fraud_count"),
-            F.avg("fraud_score").alias("avg_fraud_score"),
-            F.sum(F.when(F.col("is_fraudulent"), F.col("amount")).otherwise(0)).alias(
-                "fraud_amount"
-            ),
-        )
-        .withColumn(
-            "fraud_rate_pct",
-            F.round(F.col("fraud_count") / F.col("total_transactions") * 100, 4),
-        )
-        .orderBy(F.col("fraud_rate_pct").desc())
-    )
-
-
-def build_fraud_by_merchant(scored_df: DataFrame) -> DataFrame:
-    """Gold: Fraud aggregation by merchant."""
-    return (
-        scored_df.groupBy("merchant", "merchant_category")
-        .agg(
-            F.count("*").alias("total_transactions"),
-            F.sum(F.when(F.col("is_fraudulent"), 1).otherwise(0)).alias("fraud_count"),
-            F.avg("amount").alias("avg_amount"),
-            F.max("fraud_score").alias("max_fraud_score"),
-        )
-        .withColumn(
-            "fraud_rate_pct",
-            F.round(F.col("fraud_count") / F.col("total_transactions") * 100, 4),
-        )
-        .orderBy(F.col("fraud_count").desc())
-        .limit(100)
-    )
-
-
-def build_fraud_by_device(scored_df: DataFrame) -> DataFrame:
-    """Gold: Fraud aggregation by device using broadcast-friendly small agg."""
-    return (
-        scored_df.groupBy("device_id")
-        .agg(
-            F.count("*").alias("total_transactions"),
-            F.countDistinct("customer_id").alias("unique_customers"),
-            F.sum(F.when(F.col("is_fraudulent"), 1).otherwise(0)).alias("fraud_count"),
-            F.avg("fraud_score").alias("avg_fraud_score"),
-        )
-        .withColumn(
-            "fraud_rate_pct",
-            F.round(F.col("fraud_count") / F.col("total_transactions") * 100, 4),
-        )
-        .filter(F.col("fraud_count") > 0)
-        .orderBy(F.col("fraud_count").desc())
-        .limit(100)
-    )
-
-
-def build_daily_fraud_trend(scored_df: DataFrame) -> DataFrame:
-    """Gold: Daily fraud trend for time-series dashboards."""
-    return (
-        scored_df.groupBy("transaction_date")
-        .agg(
-            F.count("*").alias("total_transactions"),
-            F.sum(F.when(F.col("is_fraudulent"), 1).otherwise(0)).alias("fraud_count"),
-            F.sum("amount").alias("total_amount"),
-            F.sum(F.when(F.col("is_fraudulent"), F.col("amount")).otherwise(0)).alias(
-                "fraud_amount"
-            ),
-            F.avg("fraud_score").alias("avg_fraud_score"),
-        )
-        .withColumn(
-            "fraud_rate_pct",
-            F.round(F.col("fraud_count") / F.col("total_transactions") * 100, 4),
-        )
-        .orderBy("transaction_date")
-    )
-
-
-def build_customer_risk_ranking(scored_df: DataFrame) -> DataFrame:
-    """Gold: Customer risk ranking using dense_rank window function."""
-    customer_agg = (
-        scored_df.groupBy("customer_id")
-        .agg(
-            F.count("*").alias("total_transactions"),
-            F.sum(F.when(F.col("is_fraudulent"), 1).otherwise(0)).alias("fraud_count"),
-            F.max("fraud_score").alias("max_fraud_score"),
-            F.avg("fraud_score").alias("avg_fraud_score"),
-            F.sum(F.when(F.col("is_fraudulent"), F.col("amount")).otherwise(0)).alias(
-                "fraud_exposure"
-            ),
-        )
-        .withColumn(
-            "fraud_rate_pct",
-            F.round(F.col("fraud_count") / F.col("total_transactions") * 100, 4),
-        )
-    )
-
-    risk_window = Window.orderBy(
-        F.col("max_fraud_score").desc(),
-        F.col("fraud_count").desc(),
-    )
-
-    return (
-        customer_agg.withColumn("risk_rank", F.dense_rank().over(risk_window))
-        .withColumn(
-            "risk_tier",
-            F.when(F.col("risk_rank") <= 10, "CRITICAL")
-            .when(F.col("risk_rank") <= 50, "HIGH")
-            .when(F.col("risk_rank") <= 200, "MEDIUM")
-            .otherwise("LOW"),
-        )
-        .orderBy("risk_rank")
-    )
-
-
-def build_top_suspicious_accounts(scored_df: DataFrame) -> DataFrame:
-    """Gold: Top suspicious accounts with lead/lag for recent activity patterns."""
-    account_agg = (
-        scored_df.groupBy("account_id", "customer_id")
-        .agg(
-            F.count("*").alias("total_transactions"),
-            F.sum(F.when(F.col("is_fraudulent"), 1).otherwise(0)).alias("fraud_count"),
-            F.max("fraud_score").alias("max_fraud_score"),
-            F.sum("amount").alias("total_amount"),
-            F.max("timestamp").alias("last_transaction_at"),
-            F.collect_set("triggered_rules").alias("all_triggered_rules"),
-        )
-        .filter(F.col("fraud_count") > 0)
-    )
-
-    account_window = Window.orderBy(
-        F.col("max_fraud_score").desc(),
-        F.col("fraud_count").desc(),
-    )
-
-    return (
-        account_agg.withColumn("suspicion_rank", F.dense_rank().over(account_window))
-        .withColumn(
-            "suspicion_level",
-            F.when(F.col("max_fraud_score") >= 60, "SEVERE")
-            .when(F.col("max_fraud_score") >= 40, "HIGH")
-            .when(F.col("max_fraud_score") >= 25, "ELEVATED")
-            .otherwise("MODERATE"),
-        )
-        .orderBy("suspicion_rank")
-        .limit(50)
-    )
-
-
-def build_rule_trigger_summary(scored_df: DataFrame) -> DataFrame:
-    """Gold: Summary of which rules trigger most frequently."""
-    rule_cols = [c for c in scored_df.columns if c.startswith("rule_")]
-    rows = []
-    for rule in rule_cols:
-        count = scored_df.filter(F.col(rule)).count()
-        rows.append((rule, count))
-
-    return scored_df.sparkSession.createDataFrame(rows, ["rule_name", "trigger_count"]).orderBy(
-        F.col("trigger_count").desc()
-    )
-
-
-def run_gold_analytics(
-    spark: SparkSession,
-    scored_df: DataFrame,
-    config: AppConfig,
-    logger,
-) -> dict[str, int]:
-    """Build and persist all Gold layer analytics tables."""
-    gold_base = config.paths.gold
-    results: dict[str, int] = {}
-
-    tables = {
-        "fraud_scores": build_fraud_scores(scored_df),
-        "fraud_rate": build_fraud_rate(scored_df),
-        "fraud_by_country": build_fraud_by_country(scored_df),
-        "fraud_by_merchant": build_fraud_by_merchant(scored_df),
-        "fraud_by_device": build_fraud_by_device(scored_df),
-        "daily_fraud_trend": build_daily_fraud_trend(scored_df),
-        "host: localhost
-port: 5432
-database: fraud_analytics
-user: fraud_user
-password: fraud_pass
-```
-
-### 3. Generate data and run pipeline
-
-```bash
-python -m fraud_detection.data_generation.generator
-python -m fraud_detection.etl.pipeline --full-refresh
-```
-
-### 4. Run tests
-
-```bash
-pytest tests/ -v
-```
+The pipeline generates (or ingests) transaction-level data, runs it through a validated ETL flow, flags suspicious transactions using 10 independent fraud rules, and produces a set of analytics tables ready for dashboards or downstream consumption.
 
 ---
 
@@ -253,77 +37,216 @@ pytest tests/ -v
                                                           └─────────────┘
 ```
 
-### Medallion Layers
+### Medallion layers
 
 | Layer | Purpose | Storage |
 |-------|---------|---------|
-| **Bronze** | Raw ingestion with metadata | Delta Lake (partitioned by `ingestion_date`) |
-| **Silver** | Validation, dedup, schema enforcement | Delta Lake (partitioned by `transaction_date`) |
-| **Gold** | Fraud scoring and analytics KPIs | Delta Lake + PostgreSQL |
+| **Bronze** | Raw CSV ingestion with metadata enrichment (`ingestion_timestamp`, `source_file`, `ingestion_date`); idempotent `MERGE` upserts by `transaction_id` | Delta Lake, partitioned by `ingestion_date` |
+| **Silver** | Type casting, validation (nulls, valid statuses/payment types), null handling/imputation, deduplication, schema enforcement | Delta Lake, partitioned by `transaction_date` |
+| **Gold** | 10-rule fraud scoring engine + KPI/analytics tables (fraud rate, by-country, by-merchant, by-device, daily trend, customer risk ranking, top suspicious accounts, rule trigger summary) | Delta Lake + PostgreSQL |
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full system design and data flow.
 
 ---
 
-## Fraud Detection Rules
+## Fraud detection rules
+
+Each transaction is evaluated against 10 independent rules. Triggered rules contribute their weight to a cumulative `fraud_score`; a transaction is flagged `is_fraudulent` once the score crosses the threshold.
 
 | Rule | Description | Weight |
 |------|-------------|--------|
-| R1 | Amount exceeds 5× customer average | 15 |
-| R2 | >5 transactions in 2 minutes | 20 |
-| R3 | Impossible travel (NY→London in 30 min) | 25 |
-| R4 | International after domestic | 15 |
-| R5 | High-risk merchant category | 10 |
-| R6 | ≥3 declined transactions in 1 hour | 15 |
-| R7 | Night-time unusual spending (00:00–05:00) | 10 |
-| R8 | Device change within same session | 15 |
-| R9 | Large withdrawal after password reset | 20 |
-| R10 | 24h velocity fraud (amount + count) | 20 |
+| `rule_1_amount_anomaly` | Amount exceeds 5× the customer's average transaction amount | 15 |
+| `rule_2_velocity_burst` | More than 5 transactions within a 2-minute window | 20 |
+| `rule_3_impossible_travel` | Geographically impossible travel between consecutive transactions (e.g. New York → London within 30 minutes) | 25 |
+| `rule_4_intl_after_domestic` | International transaction immediately following a domestic one | 15 |
+| `rule_5_high_risk_merchant` | Merchant category in the high-risk list (gambling, cryptocurrency, money transfer, adult entertainment) | 10 |
+| `rule_6_multiple_declined` | 3 or more declined transactions within a 1-hour window | 15 |
+| `rule_7_night_spending` | Unusual spending during night hours (00:00–05:00) | 10 |
+| `rule_8_device_change` | Device changes within the same session | 15 |
+| `rule_9_post_reset_withdrawal` | Large withdrawal shortly after a password reset | 20 |
+| `rule_10_velocity_fraud` | 24-hour velocity fraud (combined amount + transaction count thresholds) | 20 |
 
-**Fraud threshold:** Score ≥ 25 → flagged as fraudulent.
+**Fraud threshold:** `fraud_score >= 25` → flagged as fraudulent (`FRAUD_SCORE_THRESHOLD` in `gold/fraud_rules.py`).
 
-See [docs/FRAUD_RULES.md](docs/FRAUD_RULES.md) for detailed rule logic.
-
----
-
-## Spark Optimizations
-
-- **Window Functions:** `lag`, `lead`, `dense_rank`, range-based windows
-- **Broadcast Join:** High-risk merchant lookup table
-- **Partitioning:** Date-based partitioning on Bronze/Silver/Gold
-- **Adaptive Query Execution (AQE):** Enabled for skew join and partition coalescing
-- **Incremental ETL:** Delta MERGE for idempotent Bronze/Silver loads
-- **Explain Plans:** Logged during Gold analytics for query review
+Rule logic is implemented with Spark window functions (`lag`, range-based windows, `dense_rank`) in [`src/fraud_detection/gold/fraud_rules.py`](src/fraud_detection/gold/fraud_rules.py). Full specifications live in [`docs/FRAUD_RULES.md`](docs/FRAUD_RULES.md).
 
 ---
 
-## Airflow Schedule
-
-| DAG | Schedule | Description |
-|-----|----------|-------------|
-| `fraud_detection_pipeline` | Daily 02:00 UTC | Full medallion pipeline |
-| `fraud_detection_incremental` | Every 4 hours | Incremental Bronze→Silver→Gold |
-
----
-
-## Project Structure
+## Project structure
 
 ```
 banking-fraud-detection/
-├── config/config.yaml          # Pipeline configuration
-├── dags/                       # Airflow DAG definitions
-├── docker/                     # Dockerfiles
-├── docs/                       # Enterprise documentation
-├── scripts/                    # Utility scripts
+├── config/
+│   └── config.yaml                 # Spark, paths, fraud-rule thresholds, Postgres, logging
+├── dags/
+│   └── fraud_detection_dag.py      # Airflow DAGs (full + incremental)
+├── docker/
+│   ├── Dockerfile                  # Spark pipeline image
+│   ├── Dockerfile.airflow          # Airflow image
+│   └── init-db.sql                 # PostgreSQL bootstrap schema
+├── docs/
+│   ├── ARCHITECTURE.md             # System design & data flow
+│   ├── FRAUD_RULES.md              # Fraud rule specifications
+│   ├── RUNBOOK.md                  # Operational runbook
+│   └── API.md                      # PostgreSQL serving-layer schema
+├── scripts/
+│   ├── run_pipeline.sh             # Linux/macOS pipeline runner
+│   └── run_pipeline.bat            # Windows pipeline runner
 ├── src/fraud_detection/
-│   ├── bronze/                 # Raw ingestion
-│   ├── silver/                 # Data quality & cleansing
-│   ├── gold/                   # Fraud rules & analytics
-│   ├── postgres/               # PostgreSQL export
-│   ├── data_generation/        # Synthetic data generator
-│   └── etl/                    # Pipeline orchestration
-├── tests/                      # pytest unit tests
-├── docker-compose.yml
+│   ├── bronze/ingest.py            # Raw ingestion → Delta (Bronze)
+│   ├── silver/transform.py         # Validation, cleansing, dedup → Delta (Silver)
+│   ├── gold/fraud_rules.py         # 10-rule fraud scoring engine
+│   ├── gold/analytics.py           # KPI & analytics table builders
+│   ├── postgres/export.py          # JDBC export of Gold tables to PostgreSQL
+│   ├── data_generation/generator.py# Synthetic transaction data generator (Faker)
+│   ├── etl/pipeline.py             # End-to-end orchestrator (CLI entry point)
+│   ├── config.py                   # YAML + env-var configuration loader
+│   ├── schemas.py                  # Bronze/Silver/Gold Spark schemas
+│   ├── spark_session.py            # SparkSession factory (Delta + AQE config)
+│   └── logging_config.py           # Structured JSON logging (structlog)
+├── tests/                          # pytest suite
+├── docker-compose.yml              # Postgres + Spark + Airflow stack
+├── pyproject.toml
 └── requirements.txt
 ```
+
+---
+
+## Getting started
+
+### 1. Prerequisites
+
+- Python 3.10+
+- Java 8/11/17 (required by PySpark)
+- Docker & Docker Compose (optional, for the full Postgres/Airflow stack)
+
+### 2. Install dependencies
+
+```bash
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+# or, for an editable install with dev/test extras:
+pip install -e ".[dev]"
+```
+
+### 3. Configure environment
+
+Copy the example environment file and adjust as needed:
+
+```bash
+cp .env.example .env
+```
+
+Key settings (see [`config/config.yaml`](config/config.yaml) and [`.env.example`](.env.example)):
+
+```
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=fraud_analytics
+POSTGRES_USER=fraud_user
+POSTGRES_PASSWORD=fraud_pass
+```
+
+### 4. Generate data and run the pipeline
+
+```bash
+python -m fraud_detection.data_generation.generator
+python -m fraud_detection.etl.pipeline --full-refresh
+```
+
+Or use the convenience script, which generates data and runs the pipeline without a PostgreSQL export:
+
+```bash
+./scripts/run_pipeline.sh          # Linux/macOS
+scripts\run_pipeline.bat           # Windows
+```
+
+CLI flags for `fraud_detection.etl.pipeline`:
+
+| Flag | Effect |
+|------|--------|
+| `--generate-data` | Generate synthetic transactions before running the pipeline |
+| `--full-refresh` | Regenerate data and run the full Bronze→Silver→Gold pipeline |
+| `--skip-postgres` | Skip the PostgreSQL export step |
+
+### 5. Run with Docker Compose (Postgres + Spark + Airflow)
+
+```bash
+docker compose up -d
+```
+
+This starts:
+- `postgres` — serving-layer database (with schema from `docker/init-db.sql`)
+- `spark` — one-shot container that generates data and runs the full pipeline
+- `airflow-init` / `airflow-webserver` / `airflow-scheduler` — Airflow stack for scheduled runs (webserver on `http://localhost:8080`)
+
+### 6. Run tests
+
+```bash
+pytest tests/ -v --tb=short
+```
+
+Test coverage includes:
+- Synthetic data generator output validation
+- Silver-layer transformation (null handling, deduplication, validation rules)
+- All 10 fraud rules against synthetic edge cases, plus overall fraud score computation
+
+---
+
+## Configuration
+
+Configuration is layered: [`config/config.yaml`](config/config.yaml) provides defaults, and environment variables (loaded via `.env`) override them at runtime. This is handled by [`src/fraud_detection/config.py`](src/fraud_detection/config.py), which exposes a typed `AppConfig` dataclass covering:
+
+- **Spark** — app name, master, adaptive query execution, shuffle partitions, broadcast threshold
+- **Paths** — raw data, Bronze/Silver/Gold Delta locations, checkpoints
+- **Data generation** — number of records/customers/accounts, fraud injection rate
+- **Fraud rules** — thresholds for every rule (amount multiplier, velocity windows, travel time, high-risk categories, declined-transaction threshold, night-hours window, withdrawal thresholds)
+- **PostgreSQL** — host, port, database, credentials, JDBC URL
+- **Logging** — level and format
+
+---
+
+## Spark optimizations
+
+- **Window functions** — `lag`, `dense_rank`, and range-based windows for velocity/travel rules and risk ranking
+- **Broadcast joins** — for the high-risk merchant lookup
+- **Partitioning** — date-based partitioning across Bronze (`ingestion_date`), Silver, and Gold layers
+- **Adaptive Query Execution (AQE)** — enabled for skew handling and partition coalescing
+- **Incremental ETL** — Delta Lake `MERGE` for idempotent Bronze/Silver loads
+- **Explain plans** — logged during Gold analytics for query review
+
+---
+
+## Orchestration (Airflow)
+
+Defined in [`dags/fraud_detection_dag.py`](dags/fraud_detection_dag.py):
+
+| DAG | Schedule | Description |
+|-----|----------|--------------|
+| `fraud_detection_pipeline` | `0 2 * * *` (daily, 02:00 UTC) | Full medallion pipeline |
+| `fraud_detection_incremental` | `0 */4 * * *` (every 4 hours) | Incremental Bronze → Silver → Gold refresh |
+
+Both DAGs retry twice with a 5-minute delay and a 2-hour execution timeout, and include a post-run validation hook.
+
+---
+
+## Serving layer
+
+Gold analytics tables are exported to PostgreSQL via JDBC (`postgres/export.py`):
+
+`fraud_scores`, `fraud_rate`, `fraud_by_country`, `fraud_by_merchant`, `fraud_by_device`, `daily_fraud_trend`, `customer_risk_ranking`, `top_suspicious_accounts`, `rule_trigger_summary` — plus a `pipeline_runs` audit table logging each run's status and stats.
+
+See [`docs/API.md`](docs/API.md) for the full serving-layer schema.
+
+---
+
+## Monitoring & logging
+
+- Structured JSON logging via `structlog` ([`logging_config.py`](src/fraud_detection/logging_config.py))
+- Pipeline events tagged with `layer`, `records`, and `duration_seconds`
+- Airflow task-level monitoring
+- `pipeline_runs` audit table in PostgreSQL
 
 ---
 
@@ -331,33 +254,10 @@ banking-fraud-detection/
 
 | Document | Description |
 |----------|-------------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design and data flow |
-| [FRAUD_RULES.md](docs/FRAUD_RULES.md) | Fraud rule specifications |
-| [RUNBOOK.md](docs/RUNBOOK.md) | Operations runbook |
-| [API.md](docs/API.md) | PostgreSQL serving layer schema |
-
----
-
-## Monitoring & Logging
-
-- Structured JSON logging via `structlog`
-- Pipeline events tagged with `layer`, `records`, `duration_seconds`
-- Airflow task-level monitoring
-- PostgreSQL `pipeline_runs` audit table
-
----
-
-## Testing
-
-```bash
-pytest tests/ -v --tb=short
-```
-
-Test coverage:
-- Data generator output validation
-- Silver transformation (null handling, dedup, validation)
-- All 10 fraud rules with synthetic edge cases
-- Fraud score computation
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System design and data flow |
+| [`docs/FRAUD_RULES.md`](docs/FRAUD_RULES.md) | Fraud rule specifications |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Operations runbook |
+| [`docs/API.md`](docs/API.md) | PostgreSQL serving-layer schema |
 
 ---
 
